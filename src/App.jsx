@@ -231,6 +231,13 @@ const normalizePot = (pot, idx) => (
 
 const normalizePlayer = (p) => ({ away: false, skipRotation: false, ...p });
 
+// "Player 3" is a suggestion the app made up, not a name anyone chose, so the
+// field renders it as a real placeholder - the first keystroke replaces it.
+// A name that was actually typed stays as a value, so tapping mid-word puts the
+// caret where you tapped and you can fix a typo without retyping the lot.
+const isDefaultName = (name) => /^Player \d+$/.test((name || '').trim());
+const defaultNameFor = (player) => `Player ${player.id}`;
+
 // Storage is not guaranteed. Safari can refuse it outright ("Block All
 // Cookies", private browsing) and a write can be rejected on a full quota;
 // a half-written or hand-edited value can also fail to parse. None of that
@@ -1084,9 +1091,18 @@ const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewG
                  <Users size={18} />
                </div>
                <input 
-                 value={player.name}
+                 value={isDefaultName(player.name) ? '' : player.name}
+                 placeholder={isDefaultName(player.name) ? player.name : 'Name'}
                  onChange={(e) => updateName(player.id, e.target.value)}
-                 className="font-medium text-slate-700 bg-transparent border-b border-transparent focus:border-emerald-500 outline-none flex-1 text-lg"
+                 onBlur={(e) => {
+                   // Never leave someone nameless; fall back to their default.
+                   if (!e.target.value.trim()) updateName(player.id, defaultNameFor(player));
+                 }}
+                 aria-label={`Player name, currently ${player.name}`}
+                 autoCapitalize="words"
+                 autoCorrect="off"
+                 spellCheck={false}
+                 className="font-medium text-slate-700 bg-transparent border-b border-transparent focus:border-emerald-500 outline-none flex-1 text-lg placeholder:text-slate-400 placeholder:font-normal"
                />
             </div>
             <span className={`text-[10px] font-bold px-2 py-1 rounded-full mr-2 uppercase tracking-wide ${player.away ? 'bg-amber-50 text-amber-700' : player.active ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
