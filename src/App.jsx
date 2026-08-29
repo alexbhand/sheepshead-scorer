@@ -238,6 +238,251 @@ const normalizePlayer = (p) => ({ away: false, skipRotation: false, ...p });
 const isDefaultName = (name) => /^Player \d+$/.test((name || '').trim());
 const defaultNameFor = (player) => `Player ${player.id}`;
 
+// --- Pure ledger actions -------------------------------------------------
+// Every money-moving action is described by a plain record and turned into
+// balance changes by a pure function. That makes a hand replayable, so an
+// entry from earlier in the night can be corrected and everything after it
+// recomputed, and it gives the stats screen real fields instead of a
+// formatted string to parse.
+
+const scoreHand = (action, pots) => {
+  const { pickerId, partnerId, outcome, grade, crack, wageredPots,
+          activeIds = [], sitterIds = [], presentIds = [] } = action;
+
+  const crackMultiplier = crack === 'recrack' ? 4 : crack === 'crack' ? 2 : 1;
+  const isAlone = !partnerId || pickerId === partnerId;
+  const opponentIds = activeIds.filter(id => id !== pickerId && id !== partnerId);
+
+  const changes = {};
+  presentIds.forEach(id => { changes[id] = 0; });
+
+  let desc = outcome === 'win' ? "Picker Won" : "Picker Lost";
+  if (outcome === 'loss') desc += " (Bump)";
+  if (grade === 'standard') desc += " (Schneider)";
+  if (grade === 'schneider') desc += " (No Sch)";
+  if (grade === 'schwarz') desc += " (Schw)";
+  if (crack === 'crack') desc += " [Cracked]";
+  if (crack === 'recrack') desc += " [Re-Cracked]";
+
+  // Rule 6 Exception: Picker Loss + Schwarz = Picker pays all, Partner pays nothing.
+  if (outcome === 'loss' && grade === 'schwarz') {
+    const penaltyPerOpponent = 3 * GAME_BASE_VALUE * crackMultiplier;
+    opponentIds.forEach(id => { changes[id] += penaltyPerOpponent; });
+    changes[pickerId] -= penaltyPerOpponent * opponentIds.length;
+    desc += " (Rule 6: Pkr pays all)";
+  } else {
+    let multiplier = 1;
+    if (grade === 'schneider') multiplier = 2;
+    if (grade === 'schwarz') multiplier = 3;
+    if (outcome === 'loss') multiplier *= 2;
+    const scoreBase = GAME_BASE_VALUE * multiplier * crackMultiplier;
+
+    if (outcome === 'win') {
+      opponentIds.forEach(id => { changes[id] -= scoreBase; });
+      if (isAlone) {
+        changes[pickerId] += scoreBase * opponentIds.length;
+      } else {
+        changes[partnerId] += scoreBase;
+        changes[pickerId] += scoreBase * 2;
+      }
+    } else if (isAlone) {
+      changes[pickerId] -= scoreBase * opponentIds.length;
+      opponentIds.forEach(id => { changes[id] += scoreBase; });
+    } else {
+      changes[partnerId] -= scoreBase;
+      changes[pickerId] -= scoreBase * 2;
+      opponentIds.forEach(id => { changes[id] += scoreBase; });
+    }
+  }
+
+  let nextPots = [...pots];
+  if (pots.length > 0 && wageredPots > 0) {
+    const potsToPlay = pots.slice(0, wageredPots);
+    const remainingPots = pots.slice(wageredPots);
+    const wagerValue = potsToPlay.reduce((sum, pot) => sum + pot.value, 0);
+
+    if (outcome === 'win') {
+      desc += ` & Pot`;
+      if (isAlone) {
+        changes[pickerId] += wagerValue;
+      } else {
+        const totalQuarters = Math.round(wagerValue / 0.25);
+        const partnerQuarters = Math.round(totalQuarters / 3);
+        changes[partnerId] += partnerQuarters * 0.25;
+        changes[pickerId] += (totalQuarters - partnerQuarters) * 0.25;
+      }
+      nextPots = remainingPots;
+    } else {
+      desc += ` & Matched Pot`;
+      if (isAlone) {
+        changes[pickerId] -= wagerValue;
+      } else {
+        const totalQuarters = Math.round(wagerValue / 0.25);
+        const partnerCostQuarters = Math.round(totalQuarters / 3);
+        changes[partnerId] -= partnerCostQuarters * 0.25;
+        changes[pickerId] -= (totalQuarters - partnerCostQuarters) * 0.25;
+      }
+      // Matched money rides as fresh pots. It is a penalty rather than an
+      // ante, so it carries no refundable ledger.
+      const matchedPots = potsToPlay.map((pot, i) => ({
+        id: makePotId(`m${i}`), value: pot.value, contributions: {}
+      }));
+      nextPots = [...pots, ...matchedPots];
+
+      if (sitterIds.length > 0) {
+        const last = nextPots[nextPots.length - 1];
+        const contributions = { ...last.contributions };
+        let sitterPenaltyTotal = 0;
+        sitterIds.forEach(id => {
+          changes[id] = money((changes[id] || 0) - POT_CONTRIBUTION);
+          contributions[id] = money((contributions[id] || 0) + POT_CONTRIBUTION);
+          sitterPenaltyTotal = money(sitterPenaltyTotal + POT_CONTRIBUTION);
+        });
+        nextPots[nextPots.length - 1] = {
+          ...last, value: money(last.value + sitterPenaltyTotal), contributions
+        };
+        desc += " + Sitters";
+      }
+    }
+  }
+
+  Object.keys(changes).forEach(id => { changes[id] = money(changes[id]); });
+  return { changes, nextPots, desc };
+};
+
+const scorePass = (action, pots) => {
+  const contributions = {};
+  const changes = {};
+  action.contributorIds.forEach(id => {
+    changes[id] = -POT_CONTRIBUTION;
+    contributions[id] = POT_CONTRIBUTION;
+  });
+  const newPot = {
+    id: makePotId(),
+    value: money(action.contributorIds.length * POT_CONTRIBUTION),
+    contributions
+  };
+  return { changes, nextPots: [...pots, newPot], desc: "Passed - Pot Added" };
+};
+
+const scoreKings = (action, pots, nameOf) => {
+  const changes = {};
+  let total = 0;
+  action.participantIds.forEach(id => {
+    if (id === action.winnerId) { changes[id] = 0; return; }
+    changes[id] = -0.25;
+    total = money(total + 0.25);
+  });
+  changes[action.winnerId] = total;
+  return { changes, nextPots: pots, desc: `3 Kings: ${nameOf(action.winnerId)}` };
+};
+
+// --- Derived reporting ---------------------------------------------------
+
+const pct = (n, d) => (d === 0 ? null : Math.round((n / d) * 100));
+
+// Separates carrying a hand from being carried: picking is a choice, being
+// named partner is not, so the two are counted apart and pairings tracked on
+// top of both.
+const computeStats = (history, players) => {
+  const byId = new Map();
+  players.forEach(p => byId.set(p.id, {
+    id: p.id, name: p.name,
+    picks: 0, pickWins: 0, alone: 0, aloneWins: 0,
+    partnered: 0, partnerWins: 0, handsSeated: 0
+  }));
+  const pairs = new Map();
+  let hands = 0;
+
+  history.forEach(entry => {
+    const a = entry.action;
+    if (!a || a.type !== 'hand') return;
+    hands += 1;
+    const won = a.outcome === 'win';
+
+    (a.activeIds || []).forEach(id => {
+      const seat = byId.get(id);
+      if (seat) seat.handsSeated += 1;
+    });
+
+    const picker = byId.get(a.pickerId);
+    if (picker) {
+      picker.picks += 1;
+      if (won) picker.pickWins += 1;
+      if (!a.partnerId) {
+        picker.alone += 1;
+        if (won) picker.aloneWins += 1;
+      }
+    }
+
+    if (a.partnerId) {
+      const partner = byId.get(a.partnerId);
+      if (partner) {
+        partner.partnered += 1;
+        if (won) partner.partnerWins += 1;
+      }
+      const key = [a.pickerId, a.partnerId].sort((x, y) => x - y).join('-');
+      const pair = pairs.get(key) || { key, ids: key.split('-').map(Number), games: 0, wins: 0 };
+      pair.games += 1;
+      if (won) pair.wins += 1;
+      pairs.set(key, pair);
+    }
+  });
+
+  return {
+    hands,
+    players: [...byId.values()],
+    pairs: [...pairs.values()].sort((a, b) => b.games - a.games || b.wins - a.wins)
+  };
+};
+
+// Fewest transfers that clear the board: repeatedly settle the biggest debt
+// against the biggest credit.
+const settleUp = (players) => {
+  const debtors = players.filter(p => p.balance < -0.001)
+    .map(p => ({ name: p.name, amt: money(-p.balance) }))
+    .sort((a, b) => b.amt - a.amt);
+  const creditors = players.filter(p => p.balance > 0.001)
+    .map(p => ({ name: p.name, amt: money(p.balance) }))
+    .sort((a, b) => b.amt - a.amt);
+
+  const transfers = [];
+  let i = 0, j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const amount = money(Math.min(debtors[i].amt, creditors[j].amt));
+    if (amount > 0) transfers.push({ from: debtors[i].name, to: creditors[j].name, amount });
+    debtors[i].amt = money(debtors[i].amt - amount);
+    creditors[j].amt = money(creditors[j].amt - amount);
+    if (debtors[i].amt <= 0.001) i += 1;
+    if (creditors[j].amt <= 0.001) j += 1;
+  }
+  return transfers;
+};
+
+// Season totals key on name: ids are per-game, the people are not.
+const seasonTotals = (nights) => {
+  const totals = new Map();
+  nights.forEach(night => {
+    (night.players || []).forEach(p => {
+      const row = totals.get(p.name) || { name: p.name, total: 0, nights: 0, best: null, worst: null };
+      row.total = money(row.total + p.balance);
+      row.nights += 1;
+      row.best = row.best === null ? p.balance : Math.max(row.best, p.balance);
+      row.worst = row.worst === null ? p.balance : Math.min(row.worst, p.balance);
+      totals.set(p.name, row);
+    });
+  });
+  return [...totals.values()].sort((a, b) => b.total - a.total);
+};
+
+// One entry point so replay and live play take exactly the same path.
+const applyAction = (action, pots, nameOf) => {
+  if (action.type === 'hand') return scoreHand(action, pots);
+  if (action.type === 'pass') return scorePass(action, pots);
+  if (action.type === 'kings') return scoreKings(action, pots, nameOf);
+  return null; // roster moves (away/return/remove) replay from their stored changes
+};
+
 // Storage is not guaranteed. Safari can refuse it outright ("Block All
 // Cookies", private browsing) and a write can be rejected on a full quota;
 // a half-written or hand-edited value can also fail to parse. None of that
@@ -270,6 +515,30 @@ const readSavedGame = () => {
 const writeSavedGame = (data) => {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// Finished nights live under their own key so starting a new game never
+// touches the season record.
+const SEASON_KEY = 'sheepshead_season';
+
+const readSeason = () => {
+  try {
+    const raw = localStorage.getItem(SEASON_KEY);
+    if (!raw) return [];
+    const data = JSON.parse(raw);
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeSeason = (nights) => {
+  try {
+    localStorage.setItem(SEASON_KEY, JSON.stringify(nights));
     return true;
   } catch {
     return false;
@@ -843,13 +1112,222 @@ const GameView = ({
   );
 };
 
+// Big type, no chrome: for when the phone is sitting in the middle of the
+// table rather than in your hand.
+const BigBoardView = ({ players, onClose }) => {
+  const ranked = [...players].sort((a, b) => b.balance - a.balance);
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900 text-white overflow-y-auto animate-in fade-in duration-200">
+      <div className="sticky top-0 flex justify-between items-center px-5 pt-[max(1rem,env(safe-area-inset-top))] pb-3 bg-slate-900/95 backdrop-blur">
+        <span className="text-[11px] font-bold uppercase tracking-[0.2em] text-slate-400">Standings</span>
+        <button onClick={onClose} aria-label="Close big scoreboard"
+          className="p-2 -m-2 text-slate-400 hover:text-white">
+          <X size={26} />
+        </button>
+      </div>
+      <div className="px-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] divide-y divide-white/10">
+        {ranked.map(p => (
+          <div key={p.id} className="flex items-center justify-between py-4">
+            <span className={`text-3xl font-bold truncate pr-3 ${p.away ? 'text-slate-500' : 'text-white'}`}>
+              {p.name}
+              {p.away && <span className="ml-2 text-xs uppercase tracking-wide text-amber-500/80">away</span>}
+            </span>
+            <span className={`text-4xl font-mono font-black tabular-nums ${p.balance > 0 ? 'text-emerald-400' : p.balance < 0 ? 'text-rose-400' : 'text-slate-500'}`}>
+              {p.balance < 0 ? '-' : p.balance > 0 ? '+' : ''}${Math.abs(p.balance).toFixed(2)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+const SeasonView = ({ season, setView, clearSeason }) => {
+  const totals = seasonTotals(season);
+  return (
+    <div className="space-y-6 pb-24 animate-in fade-in duration-200">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-bold text-slate-800">Season Ledger</h2>
+        <button onClick={() => setView('stats')} aria-label="Close season"
+          className="p-2 bg-slate-100 rounded-full hover:bg-slate-200">
+          <X size={20} />
+        </button>
+      </div>
+
+      {season.length === 0 ? (
+        <Card className="p-6 text-center space-y-2">
+          <Trophy size={36} className="mx-auto text-slate-300" />
+          <h3 className="font-bold text-slate-700">No nights recorded yet</h3>
+          <p className="text-sm text-slate-500">
+            A night is added here when you start a new game, so tonight&apos;s scores are kept
+            once you move on.
+          </p>
+        </Card>
+      ) : (
+        <>
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+              Running totals - {season.length} night{season.length === 1 ? '' : 's'}
+            </h3>
+            <div className="space-y-2">
+              {totals.map((t, i) => (
+                <div key={t.name} className="flex items-center justify-between p-3 bg-white rounded-xl border border-slate-200 shadow-sm">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className={`w-7 h-7 shrink-0 rounded-full text-[11px] font-black flex items-center justify-center ${i === 0 ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-400'}`}>
+                      {i + 1}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="font-bold text-slate-800 truncate">{t.name}</div>
+                      <div className="text-[10px] text-slate-400">
+                        {t.nights} night{t.nights === 1 ? '' : 's'} · best {t.best >= 0 ? '+' : '-'}${Math.abs(t.best).toFixed(2)} · worst {t.worst >= 0 ? '+' : '-'}${Math.abs(t.worst).toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                  <div className={`text-lg font-mono font-bold shrink-0 ${t.total >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {t.total < 0 ? '-' : '+'}${Math.abs(t.total).toFixed(2)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Nights</h3>
+            <div className="space-y-2">
+              {season.map(night => (
+                <div key={night.id} className="p-3 bg-white rounded-xl border border-slate-100 shadow-sm">
+                  <div className="flex justify-between items-baseline mb-1">
+                    <span className="text-sm font-bold text-slate-700">
+                      {new Date(night.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                    </span>
+                    <span className="text-[10px] text-slate-400">{night.hands} hand{night.hands === 1 ? '' : 's'}</span>
+                  </div>
+                  <div className="text-[11px] text-slate-500 leading-relaxed">
+                    {[...night.players].sort((a, b) => b.balance - a.balance).map(p => (
+                      <span key={p.name} className="mr-3 whitespace-nowrap">
+                        {p.name}{' '}
+                        <span className={p.balance >= 0 ? 'text-emerald-600 font-semibold' : 'text-rose-600 font-semibold'}>
+                          {p.balance < 0 ? '-' : '+'}${Math.abs(p.balance).toFixed(2)}
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <button onClick={clearSeason}
+            className="w-full text-xs font-medium text-slate-400 hover:text-rose-500 py-3">
+            Clear season history
+          </button>
+        </>
+      )}
+    </div>
+  );
+};
+
+// Corrects one hand from earlier in the night. Only the details that decide
+// the score are editable; who was seated stays as recorded.
+const EditHandModal = ({ entry, index, players, laterHands, onCancel, onSave }) => {
+  const a = entry.action;
+  const [pickerId, setPickerId] = useState(a.pickerId);
+  const [partnerId, setPartnerId] = useState(a.partnerId ?? null);
+  const [outcome, setOutcome] = useState(a.outcome);
+  const [grade, setGrade] = useState(a.grade);
+  const [crack, setCrack] = useState(a.crack || 'none');
+
+  const seated = (a.activeIds || []).map(id => players.find(p => p.id === id)).filter(Boolean);
+  const nameFor = (id) => players.find(p => p.id === id)?.name || 'Unknown';
+  const preview = scoreHand({ ...a, pickerId, partnerId, outcome, grade, crack },
+                            (entry.prevPots || []));
+
+  const chip = (on) => `px-3 py-2 rounded-lg text-xs font-bold border-2 transition-all active:scale-95 ${on ? 'bg-slate-800 text-white border-slate-800' : 'bg-white text-slate-500 border-slate-200'}`;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+      <Card className="w-full max-w-sm max-h-[90vh] overflow-y-auto p-5 space-y-4 animate-in zoom-in-95 duration-200">
+        <div>
+          <h3 className="text-lg font-bold text-slate-800">Correct this hand</h3>
+          <p className="text-[11px] text-slate-400 mt-0.5">
+            {entry.timestamp} · {laterHands === 0
+              ? 'the most recent entry'
+              : `${laterHands} later entr${laterHands === 1 ? 'y' : 'ies'} will be recomputed`}
+          </p>
+        </div>
+
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">Picker</div>
+          <div className="grid grid-cols-3 gap-2">
+            {seated.map(p => (
+              <button key={p.id} onClick={() => { setPickerId(p.id); if (partnerId === p.id) setPartnerId(null); }}
+                className={chip(pickerId === p.id)}>{p.name}</button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">Partner</div>
+          <div className="grid grid-cols-3 gap-2">
+            {seated.filter(p => p.id !== pickerId).map(p => (
+              <button key={p.id} onClick={() => setPartnerId(partnerId === p.id ? null : p.id)}
+                className={chip(partnerId === p.id)}>{p.name}</button>
+            ))}
+            <button onClick={() => setPartnerId(null)} className={chip(!partnerId)}>Alone</button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button onClick={() => setOutcome('win')} className={chip(outcome === 'win')}>Picker Won</button>
+          <button onClick={() => setOutcome('loss')} className={chip(outcome === 'loss')}>Picker Lost</button>
+        </div>
+
+        <div className="grid grid-cols-3 gap-2">
+          <button onClick={() => setGrade('standard')} className={chip(grade === 'standard')}>Schneider</button>
+          <button onClick={() => setGrade('schneider')} className={chip(grade === 'schneider')}>No Sch</button>
+          <button onClick={() => setGrade('schwarz')} className={chip(grade === 'schwarz')}>No Trick</button>
+        </div>
+
+        <div className="grid grid-cols-3 gap-2">
+          <button onClick={() => setCrack('none')} className={chip(crack === 'none')}>No Crack</button>
+          <button onClick={() => setCrack('crack')} className={chip(crack === 'crack')}>Crack</button>
+          <button onClick={() => setCrack('recrack')} className={chip(crack === 'recrack')}>Re-Crack</button>
+        </div>
+
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Becomes</div>
+          <div className="text-xs font-medium text-slate-700 mb-2">{preview.desc}</div>
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-mono">
+            {Object.entries(preview.changes).filter(([, v]) => v !== 0).map(([id, v]) => (
+              <span key={id} className={v > 0 ? 'text-emerald-600' : 'text-rose-600'}>
+                {nameFor(Number(id))} {v > 0 ? '+' : '-'}${Math.abs(v).toFixed(2)}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex gap-3">
+          <Button variant="secondary" className="flex-1 py-3" onClick={onCancel}>Cancel</Button>
+          <Button className="flex-1 py-3"
+            onClick={() => onSave(index, { ...a, pickerId, partnerId, outcome, grade, crack })}>
+            Save
+          </Button>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
 const statusLabel = (player) => {
   if (player.away) return 'Away — balance frozen';
   if (player.skipRotation) return player.active ? 'Playing — skipping deals' : 'Sitting out — skipping deals';
   return player.active ? 'Playing' : 'Sitting out';
 };
 
-const StatsView = ({ players, history, manuallySetDealer, dealerId, updateName, toggleSkipRotation, toggleAway, potCount }) => {
+const StatsView = ({ players, history, manuallySetDealer, dealerId, updateName, toggleSkipRotation, toggleAway, potCount, setView, setShowBigBoard, setEditingHand }) => {
+  const stats = useMemo(() => computeStats(history, players), [history, players]);
+  const transfers = useMemo(() => settleUp(players), [players]);
+  const potsLive = potCount > 0;
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
       <div>
@@ -907,16 +1385,128 @@ const StatsView = ({ players, history, manuallySetDealer, dealerId, updateName, 
         </div>
       </div>
 
+      <div className="grid grid-cols-2 gap-2">
+        <Button variant="secondary" onClick={() => setShowBigBoard(true)} className="py-3 bg-white border border-slate-200">
+          <LayoutGrid size={16} /> Big Board
+        </Button>
+        <Button variant="secondary" onClick={() => setView('season')} className="py-3 bg-white border border-slate-200">
+          <Trophy size={16} /> Season
+        </Button>
+      </div>
+
+      {transfers.length > 0 && (
+        <div>
+          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Settle Up</h3>
+          <Card className="p-4 space-y-2">
+            {potsLive && (
+              <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-1">
+                There is still money in the pot, so these totals are not final.
+              </p>
+            )}
+            {transfers.map((t, i) => (
+              <div key={i} className="flex items-center justify-between text-sm">
+                <span className="text-slate-700 min-w-0 truncate">
+                  <span className="font-bold">{t.from}</span>
+                  <span className="text-slate-400"> pays </span>
+                  <span className="font-bold">{t.to}</span>
+                </span>
+                <span className="font-mono font-bold text-slate-800 shrink-0 ml-2">${t.amount.toFixed(2)}</span>
+              </div>
+            ))}
+            <p className="text-[10px] text-slate-400 pt-1">
+              Fewest payments that square everyone up. Included when you email the scores.
+            </p>
+          </Card>
+        </div>
+      )}
+
+      {stats.hands > 0 && (
+        <div>
+          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+            Picking - {stats.hands} hand{stats.hands === 1 ? '' : 's'}
+          </h3>
+          <div className="space-y-2">
+            {stats.players.filter(p => p.picks > 0 || p.partnered > 0).map(p => (
+              <div key={p.id} className="p-3 bg-white rounded-xl border border-slate-200 shadow-sm">
+                <div className="flex justify-between items-baseline mb-2">
+                  <span className="font-bold text-slate-800 truncate">{p.name}</span>
+                  {p.alone > 0 && (
+                    <span className="text-[10px] text-slate-400">
+                      {p.aloneWins}/{p.alone} alone
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <div className="bg-emerald-50/60 border border-emerald-100 rounded-lg px-2 py-1.5">
+                    <div className="text-[9px] font-bold uppercase tracking-wide text-emerald-700/70">Picked</div>
+                    <div className="font-mono font-bold text-slate-800">
+                      {p.pickWins}/{p.picks}
+                      {pct(p.pickWins, p.picks) !== null && (
+                        <span className="text-emerald-700 ml-1">{pct(p.pickWins, p.picks)}%</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="bg-purple-50/60 border border-purple-100 rounded-lg px-2 py-1.5">
+                    <div className="text-[9px] font-bold uppercase tracking-wide text-purple-700/70">Partnered</div>
+                    <div className="font-mono font-bold text-slate-800">
+                      {p.partnerWins}/{p.partnered}
+                      {pct(p.partnerWins, p.partnered) !== null && (
+                        <span className="text-purple-700 ml-1">{pct(p.partnerWins, p.partnered)}%</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {stats.pairs.some(pair => pair.ids.every(id => players.some(p => p.id === id))) && (
+        <div>
+          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Partnerships</h3>
+          <div className="space-y-2">
+            {stats.pairs.filter(pair => pair.ids.every(id => players.some(p => p.id === id))).map(pair => {
+              const rate = pct(pair.wins, pair.games);
+              return (
+                <div key={pair.key} className="flex items-center justify-between p-3 bg-white rounded-xl border border-slate-200 shadow-sm">
+                  <span className="text-sm font-bold text-slate-700 truncate pr-2">
+                    {pair.ids.map(id => players.find(p => p.id === id)?.name || '?').join(' & ')}
+                  </span>
+                  <span className="text-xs font-mono shrink-0">
+                    <span className="text-slate-400">{pair.wins}/{pair.games}</span>
+                    <span className={`ml-2 font-bold ${rate >= 50 ? 'text-emerald-600' : 'text-rose-600'}`}>{rate}%</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {history.length > 0 && (
         <div className="pb-20">
-          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Recent Activity</h3>
+          <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+            Recent Activity <span className="normal-case font-medium text-slate-300">- tap a hand to correct it</span>
+          </h3>
           <div className="space-y-2">
-            {history.slice(0, 10).map(h => (
-               <div key={h.id} className="text-xs text-slate-500 bg-white p-3 rounded-lg border border-slate-100 flex justify-between shadow-sm items-center">
-                 <span className="font-medium text-slate-700">{h.desc}</span>
-                 <span className="font-mono text-[10px] text-slate-400">{h.timestamp}</span>
-               </div>
-            ))}
+            {history.slice(0, 15).map((h, i) => {
+              const editable = h.action?.type === 'hand';
+              return (
+                <button
+                  key={h.id}
+                  disabled={!editable}
+                  onClick={() => editable && setEditingHand(i)}
+                  className={`w-full text-left text-xs p-3 rounded-lg border flex justify-between items-center gap-2 shadow-sm ${editable ? 'bg-white border-slate-100 hover:border-emerald-300 active:scale-[0.99] transition-all' : 'bg-slate-50 border-slate-100 cursor-default'}`}
+                >
+                  <span className="font-medium text-slate-700 min-w-0">
+                    {h.desc}
+                    {h.edited && <span className="ml-1 text-[9px] uppercase tracking-wide text-amber-600">edited</span>}
+                  </span>
+                  <span className="font-mono text-[10px] text-slate-400 shrink-0">{h.timestamp}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
@@ -1039,6 +1629,18 @@ const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewG
 
     const net = players.reduce((sum, p) => sum + p.balance, 0);
     bodyText += `\nTable net: ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}\n`;
+
+    // Quarters rarely change hands on the night, so spell out who owes whom.
+    const transfers = settleUp(players);
+    if (transfers.length > 0) {
+        bodyText += `\nSettle up:\n`;
+        transfers.forEach(t => {
+            bodyText += `  ${t.from} pays ${t.to} $${t.amount.toFixed(2)}\n`;
+        });
+        if (pots.length > 0) {
+            bodyText += `  (note: $${totalPotValue.toFixed(2)} still in the pot, so this is not final)\n`;
+        }
+    }
 
     if (pots.length > 0) {
         bodyText += `\nActive Pots: ${pots.length} ($${totalPotValue.toFixed(2)})`;
@@ -1190,6 +1792,9 @@ export default function App() {
   const [resetPreview, setResetPreview] = useState([]);
   const [playerToRemove, setPlayerToRemove] = useState(null);
   const [storageNotice, setStorageNotice] = useState(null);
+  const [editingHand, setEditingHand] = useState(null);
+  const [season, setSeason] = useState([]);
+  const [showBigBoard, setShowBigBoard] = useState(false);
   const [showKingsLyrics, setShowKingsLyrics] = useState(false);
 
   // Scoring State
@@ -1213,6 +1818,7 @@ export default function App() {
     // can never be a dead end.
     const { status, data } = readSavedGame();
     setHasSavedGame(!!data);
+    setSeason(readSeason());
     if (status === STORAGE_UNREADABLE) {
       setStorageNotice("A saved game was found but could not be read, so it has been set aside. Starting a new game will overwrite it.");
     } else if (status === STORAGE_UNWRITABLE) {
@@ -1269,7 +1875,25 @@ export default function App() {
 
   // Same group most weeks, so a new game keeps names and seat order and only
   // zeroes the money. Away and skip-deals are tonight's business, so they clear.
+  // A finished night is worth keeping even though the game itself is cleared.
+  const archiveFinishedGame = () => {
+    const { data } = readSavedGame();
+    if (!data) return;
+    const handCount = (data.history || []).filter(h => h.action?.type === 'hand').length;
+    const anyMoney = (data.players || []).some(p => p.balance !== 0);
+    if (!handCount && !anyMoney) return;
+    const night = {
+      id: Date.now(),
+      date: new Date().toISOString(),
+      hands: handCount,
+      players: (data.players || []).map(p => ({ name: p.name, balance: p.balance }))
+    };
+    const nights = [night, ...readSeason()];
+    if (writeSeason(nights)) setSeason(nights);
+  };
+
   const performReset = (keepRoster) => {
+    archiveFinishedGame();
     // Only a roster carried over from a real saved game is worth going straight
     // to play with; anything else still needs names typed in.
     const carried = keepRoster ? savedRoster() : null;
@@ -1298,6 +1922,13 @@ export default function App() {
     showToast(carried ? "New game - same players" : "New game - name your players");
   };
 
+  const clearSeason = () => {
+    if (writeSeason([])) {
+      setSeason([]);
+      showToast("Season history cleared");
+    }
+  };
+
   const requestNewGame = () => {
     const hasData = hasSavedGame || players.some(p => p.balance !== 0) || history.length > 0;
     if (hasData) {
@@ -1310,6 +1941,7 @@ export default function App() {
 
   // --- Logic Helpers ---
 
+  const nameOf = (id) => players.find(p => p.id === id)?.name || 'Unknown';
   const presentPlayers = players.filter(p => !p.away);
   const activePlayers = players.filter(p => p.active && !p.away);
   const totalPotValue = pots.reduce((sum, pot) => sum + pot.value, 0);
@@ -1476,18 +2108,9 @@ export default function App() {
   const handlePass = () => {
     // Everyone at the table antes, whether or not they were dealt in. Away
     // players do not, so the pot is smaller while they are gone.
-    const contributions = {};
-    const changes = {};
-    presentPlayers.forEach(p => {
-      changes[p.id] = -POT_CONTRIBUTION;
-      contributions[p.id] = POT_CONTRIBUTION;
-    });
-    const newPot = {
-      id: makePotId(),
-      value: money(presentPlayers.length * POT_CONTRIBUTION),
-      contributions
-    };
-    applyTransaction(changes, [...pots, newPot], "Passed - Pot Added", true);
+    const action = { type: 'pass', contributorIds: presentPlayers.map(p => p.id) };
+    const { changes, nextPots, desc } = scorePass(action, pots);
+    applyTransaction(changes, nextPots, desc, true, action);
     showToast("Pot Added");
   };
 
@@ -1501,154 +2124,41 @@ export default function App() {
   };
 
   const handleThreeKings = (winnerId) => {
-    const changes = {};
-    let total = 0;
-    presentPlayers.forEach(p => {
-      if (p.id !== winnerId) {
-        changes[p.id] = -0.25;
-        total = money(total + 0.25);
-      } else {
-        changes[p.id] = 0; 
-      }
-    });
-    changes[winnerId] = total;
-    applyTransaction(changes, pots, `3 Kings: ${players.find(p => p.id === winnerId).name}`, false);
+    const action = { type: 'kings', winnerId, participantIds: presentPlayers.map(p => p.id) };
+    const { changes, nextPots, desc } = scoreKings(action, pots, nameOf);
+    applyTransaction(changes, nextPots, desc, false, action);
     showToast("3 Kings Payout Applied");
     setView('game'); // Return to game view
   };
 
   const calculateScore = () => {
     if (!pickerId) return;
-
-    // Crack Multiplier
-    let crackMultiplier = 1;
-    if (crackState === 'crack') crackMultiplier = 2;
-    if (crackState === 'recrack') crackMultiplier = 4;
-
-    const activeIds = activePlayers.map(p => p.id);
-    const isAlone = !partnerId || pickerId === partnerId;
-    const opponentIds = activeIds.filter(id => id !== pickerId && id !== partnerId);
-    const changes = {};
-    presentPlayers.forEach(p => changes[p.id] = 0);
-    
-    let desc = outcome === 'win' ? "Picker Won" : "Picker Lost";
-    if (outcome === 'loss') desc += " (Bump)";
-    
-    if (handGrade === 'standard') desc += " (Schneider)";
-    if (handGrade === 'schneider') desc += " (No Sch)";
-    if (handGrade === 'schwarz') desc += " (Schw)";
-    
-    if (crackState === 'crack') desc += " [Cracked]";
-    if (crackState === 'recrack') desc += " [Re-Cracked]";
-
-    // Rule 6 Exception: Picker Loss + Schwarz = Picker pays all, Partner pays nothing.
-    if (outcome === 'loss' && handGrade === 'schwarz') {
-       const penaltyPerOpponent = 3 * GAME_BASE_VALUE * crackMultiplier; 
-       opponentIds.forEach(id => changes[id] += penaltyPerOpponent);
-       changes[pickerId] -= penaltyPerOpponent * opponentIds.length;
-       desc += " (Rule 6: Pkr pays all)";
-    } else {
-        let multiplier = 1;
-        if (handGrade === 'schneider') multiplier = 2; 
-        if (handGrade === 'schwarz') multiplier = 3;
-        if (outcome === 'loss') multiplier *= 2; 
-
-        const scoreBase = GAME_BASE_VALUE * multiplier * crackMultiplier;
-
-        if (outcome === 'win') {
-          opponentIds.forEach(id => changes[id] -= scoreBase);
-          if (isAlone) {
-            changes[pickerId] += scoreBase * opponentIds.length;
-          } else {
-            changes[partnerId] += scoreBase;
-            changes[pickerId] += scoreBase * 2;
-          }
-        } else {
-          // Loss
-          if (isAlone) {
-            changes[pickerId] -= scoreBase * opponentIds.length;
-            opponentIds.forEach(id => changes[id] += scoreBase);
-          } else {
-            changes[partnerId] -= scoreBase;
-            changes[pickerId] -= scoreBase * 2;
-            opponentIds.forEach(id => changes[id] += scoreBase);
-          }
-        }
-    }
-
-    let nextPots = [...pots];
-    const sitters = presentPlayers.filter(p => !p.active);
-    
-    if (pots.length > 0 && wageredPots > 0) {
-      const potsToPlay = pots.slice(0, wageredPots);
-      const remainingPots = pots.slice(wageredPots);
-      const wagerValue = potsToPlay.reduce((sum, pot) => sum + pot.value, 0);
-
-      if (outcome === 'win') {
-        desc += ` & Pot`;
-        if (isAlone) {
-          changes[pickerId] += wagerValue;
-        } else {
-          const totalQuarters = Math.round(wagerValue / 0.25);
-          const partnerQuarters = Math.round(totalQuarters / 3);
-          const pickerQuarters = totalQuarters - partnerQuarters;
-          changes[partnerId] += partnerQuarters * 0.25;
-          changes[pickerId] += pickerQuarters * 0.25;
-        }
-        nextPots = remainingPots;
-      } else {
-        desc += ` & Matched Pot`;
-        const matchAmount = wagerValue; 
-        
-        if (isAlone) {
-          changes[pickerId] -= matchAmount;
-        } else {
-          const totalQuarters = Math.round(matchAmount / 0.25);
-          const partnerCostQuarters = Math.round(totalQuarters / 3);
-          const pickerCostQuarters = totalQuarters - partnerCostQuarters;
-          changes[partnerId] -= partnerCostQuarters * 0.25;
-          changes[pickerId] -= pickerCostQuarters * 0.25;
-        }
-        
-        // FIXED POT LOGIC: the matched money rides as fresh pots. It is a
-        // penalty rather than an ante, so it carries no refundable ledger.
-        const matchedPots = potsToPlay.map((pot, i) => ({
-          id: makePotId(`m${i}`),
-          value: pot.value,
-          contributions: {}
-        }));
-        nextPots = [...pots, ...matchedPots];
-
-        if (sitters.length > 0) {
-          const last = nextPots[nextPots.length - 1];
-          const contributions = { ...last.contributions };
-          let sitterPenaltyTotal = 0;
-          sitters.forEach(s => {
-            changes[s.id] -= POT_CONTRIBUTION;
-            contributions[s.id] = money((contributions[s.id] || 0) + POT_CONTRIBUTION);
-            sitterPenaltyTotal = money(sitterPenaltyTotal + POT_CONTRIBUTION);
-          });
-          // Add sitter penalty to the last pot in the array
-          nextPots[nextPots.length - 1] = {
-            ...last,
-            value: money(last.value + sitterPenaltyTotal),
-            contributions
-          };
-          desc += " + Sitters";
-        }
-      }
-    }
-
-    applyTransaction(changes, nextPots, desc, true);
+    const action = {
+      type: 'hand',
+      pickerId,
+      partnerId: (!partnerId || partnerId === pickerId) ? null : partnerId,
+      outcome,
+      grade: handGrade,
+      crack: crackState,
+      wageredPots: pots.length > 0 ? wageredPots : 0,
+      // The table composition is recorded with the hand so a correction made
+      // later replays against who was actually seated at the time.
+      activeIds: activePlayers.map(p => p.id),
+      sitterIds: presentPlayers.filter(p => !p.active).map(p => p.id),
+      presentIds: presentPlayers.map(p => p.id)
+    };
+    const { changes, nextPots, desc } = scoreHand(action, pots);
+    applyTransaction(changes, nextPots, desc, true, action);
     showToast(outcome === 'win' ? "Score Saved: Picker Won" : "Score Saved: Picker Lost");
   };
 
   // Records the move and swaps state in. `resetHand` is off for roster changes
   // so they don't clear a half-entered hand or yank you out of the current view.
-  const commit = (nextPlayers, nextPots, nextDealerId, changes, description, resetHand = true) => {
+  const commit = (nextPlayers, nextPots, nextDealerId, changes, description, resetHand = true, action = null) => {
     setHistory([{
       id: Date.now(),
       desc: description,
+      action,
       changes: changes,
       prevPots: pots,
       newPots: nextPots,
@@ -1672,7 +2182,7 @@ export default function App() {
     }
   };
 
-  const applyTransaction = (changes, newPots, description, shouldRotateDealer) => {
+  const applyTransaction = (changes, newPots, description, shouldRotateDealer, action = null) => {
     let nextPlayers = players.map(p => ({
       ...p,
       balance: money(p.balance + (changes[p.id] || 0))
@@ -1684,7 +2194,51 @@ export default function App() {
       nextPlayers = recomputeSeating(nextDealerId, nextPlayers);
     }
 
-    commit(nextPlayers, newPots, nextDealerId, changes, description);
+    commit(nextPlayers, newPots, nextDealerId, changes, description, true, action);
+  };
+
+  // Correct a hand from earlier in the night: re-run it with the new details,
+  // then replay every later entry on top so balances and pots land where they
+  // would have if it had been entered right the first time. The dealer button
+  // is deliberately left alone - fixing an old score should not rewind whose
+  // turn it is now.
+  const saveEditedHand = (index, editedAction) => {
+    const entry = history[index];
+    if (!entry) return;
+
+    const balances = {};
+    (entry.prevPlayers || players).forEach(p => { balances[p.id] = p.balance; });
+    let potsState = (entry.prevPots || []).map(normalizePot);
+    const rebuilt = [];
+
+    for (let i = index; i >= 0; i -= 1) {
+      const h = history[i];
+      const action = i === index ? editedAction : h.action;
+      const snapshot = players.map(p => ({ ...p, balance: balances[p.id] ?? 0 }));
+      // Roster moves (away, return, removal) have no recomputable spec, so
+      // their recorded changes are re-applied as they stand.
+      const result = action ? applyAction(action, potsState, nameOf) : null;
+      const changes = result ? result.changes : (h.changes || {});
+      const nextPots = result ? result.nextPots : (h.newPots || []).map(normalizePot);
+      const desc = result ? result.desc : h.desc;
+
+      Object.entries(changes).forEach(([id, delta]) => {
+        balances[id] = money((balances[id] || 0) + delta);
+      });
+
+      rebuilt.unshift({
+        ...h, action, changes, desc,
+        prevPots: potsState, newPots: nextPots, prevPlayers: snapshot,
+        edited: i === index ? true : h.edited
+      });
+      potsState = nextPots;
+    }
+
+    setHistory([...rebuilt, ...history.slice(index + 1)]);
+    setPlayers(players.map(p => ({ ...p, balance: balances[p.id] ?? p.balance })));
+    setPots(potsState);
+    setEditingHand(null);
+    showToast(index === 0 ? "Hand corrected" : `Hand corrected - ${index} later hand${index === 1 ? '' : 's'} recomputed`);
   };
 
   const undoLast = () => {
@@ -1745,8 +2299,9 @@ export default function App() {
         {view === 'rules' && <RulesView setView={setView} />}
         {/* GameView now replaces ScoreboardView + NewHandView logic for main play */}
         {view === 'game' && <GameView activePlayers={activePlayers} presentPlayers={presentPlayers} toggleSeat={toggleSeat} passDeal={passDeal} pots={pots} totalPotValue={totalPotValue} handlePass={handlePass} wageredPots={wageredPots} setWageredPots={setWageredPots} pickerId={pickerId} setPickerId={setPickerId} partnerId={partnerId} setPartnerId={setPartnerId} crackState={crackState} setCrackState={setCrackState} outcome={outcome} setOutcome={setOutcome} handGrade={handGrade} setHandGrade={setHandGrade} calculateScore={calculateScore} setView={setView} players={players} dealerId={dealerId} startThreeKings={startThreeKings} />}
-        {view === 'stats' && <StatsView players={players} history={history} manuallySetDealer={manuallySetDealer} dealerId={dealerId} updateName={updateName} toggleSkipRotation={toggleSkipRotation} toggleAway={toggleAway} potCount={pots.length} />}
+        {view === 'stats' && <StatsView players={players} history={history} manuallySetDealer={manuallySetDealer} dealerId={dealerId} updateName={updateName} toggleSkipRotation={toggleSkipRotation} toggleAway={toggleAway} potCount={pots.length} setView={setView} setShowBigBoard={setShowBigBoard} setEditingHand={setEditingHand} />}
         {view === 'players' && <PlayersView players={players} addPlayer={addPlayer} updateName={updateName} removePlayer={requestRemovePlayer} requestNewGame={requestNewGame} pots={pots} totalPotValue={totalPotValue} toggleAway={toggleAway} dealerId={dealerId} reorderPlayers={reorderPlayers} movePlayer={movePlayer} />}
+        {view === 'season' && <SeasonView season={season} setView={setView} clearSeason={clearSeason} />}
         {view === 'kings' && <ThreeKingsView presentPlayers={presentPlayers} handleThreeKings={handleThreeKings} setView={setView} />}
       </main>
 
@@ -1807,6 +2362,21 @@ export default function App() {
             </div>
           </Card>
         </div>
+      )}
+
+      {showBigBoard && (
+        <BigBoardView players={players} onClose={() => setShowBigBoard(false)} />
+      )}
+
+      {editingHand !== null && history[editingHand]?.action?.type === 'hand' && (
+        <EditHandModal
+          entry={history[editingHand]}
+          index={editingHand}
+          players={players}
+          laterHands={editingHand}
+          onCancel={() => setEditingHand(null)}
+          onSave={saveEditedHand}
+        />
       )}
 
       {/* Remove Player Confirmation */}
