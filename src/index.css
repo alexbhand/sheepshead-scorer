@@ -1,3 +1,53 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* --- iOS / touch behaviour --- */
+
+/* Grey flash on every tap reads as jank on iPhone; the components already
+   have their own active: states. */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html {
+  /* iOS Safari's 100vh sits behind the URL bar. */
+  min-height: 100dvh;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* Stops the whole page rubber-banding under the fixed bottom nav. */
+  overscroll-behavior-y: none;
+}
+
+/* Safari zooms the page when a focused input is under 16px. Scoring happens
+   one-handed mid-hand, so that zoom is disruptive. This is only a default —
+   a Tailwind text-* class on the element still wins on specificity, so keep
+   inputs at text-base or larger. */
+input,
+select,
+textarea {
+  font-size: 16px;
+}
+
+/* Dragging a seat must not select text or raise the iOS callout menu. */
+[data-drag-handle] {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* The entrance animations only started rendering once tailwindcss-animate was
+   added; honour the system setting rather than animating regardless. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
