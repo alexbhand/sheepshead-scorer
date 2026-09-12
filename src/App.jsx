@@ -1,5 +1,15 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { twMerge } from 'tailwind-merge';
+import { createPortal } from 'react-dom';
+import {
+  DndContext, DragOverlay, MouseSensor, TouchSensor, KeyboardSensor,
+  useSensor, useSensors, pointerWithin, useDraggable
+} from '@dnd-kit/core';
+import {
+  SortableContext, useSortable, rectSortingStrategy,
+  verticalListSortingStrategy, sortableKeyboardCoordinates
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { Plus, Trash2, Users, DollarSign, History, Settings, UserPlus, X, Trophy, AlertTriangle, CheckCircle, RotateCcw, Zap, Crown, Play, BookOpen, LogOut, Club, Diamond, Hammer, Mail, Send, TrendingUp, LayoutGrid, Check, Music, Coffee, SkipForward, GripVertical, ChevronUp, ChevronDown, ArrowUpDown } from 'lucide-react';
 
 // --- UI Components ---
@@ -820,12 +830,135 @@ const ThreeKingsView = ({ presentPlayers, handleThreeKings, setView }) => (
   </div>
 );
 
+// --- Drag plumbing ---------------------------------------------------------
+// A puck is tapped far more often than it is dragged, so dragging has to be
+// deliberate: a press-and-hold on touch, a bit of travel with a mouse. That
+// keeps tap-to-sit-out instant while still allowing a drag from the same
+// element.
+const useTactileSensors = () => useSensors(
+  useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+  useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } }),
+  useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+);
+
+const DRAG_HINT = 'Drop outside the table to cancel';
+
+// The dealer button as a physical token: drag it onto whoever is dealing
+// instead of stepping the deal round one player at a time.
+const DealerToken = ({ onLight }) => {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: 'dealer-token',
+    data: { type: 'dealer' }
+  });
+  // The visible token stays puck-sized, but the grab area is padded out to a
+  // thumb-sized target - it is the one thing here you are meant to drag.
+  return (
+    <span
+      ref={setNodeRef}
+      {...listeners}
+      {...attributes}
+      role="button"
+      aria-label="Dealer button - drag onto another player to pass the deal"
+      title="Drag onto another player to make them dealer"
+      style={{ touchAction: 'manipulation' }}
+      className={`p-2 -m-2 flex items-center justify-center cursor-grab active:cursor-grabbing select-none ${isDragging ? 'opacity-30' : ''}`}
+    >
+      <span
+        className={`w-7 h-7 rounded-full text-[10px] font-black flex items-center justify-center ring-2 transition-transform ${onLight ? 'bg-white text-emerald-700 ring-white/70' : 'bg-slate-800 text-white ring-slate-300'}`}
+      >
+        D
+      </span>
+    </span>
+  );
+};
+
+// An empty dealer slot only shows itself while the token is in the air, so the
+// resting state stays uncluttered.
+const DealerSlot = ({ armed, onLight }) => (
+  <span
+    aria-hidden="true"
+    className={`w-6 h-6 rounded-full border-2 border-dashed flex items-center justify-center text-[9px] font-black transition-all ${armed ? (onLight ? 'border-white/70 text-white/70 scale-110' : 'border-emerald-400 text-emerald-500 scale-110') : 'border-transparent'}`}
+  >
+    {armed ? 'D' : ''}
+  </span>
+);
+
+const SortablePuck = ({ player, isDealer, dealerArmed, onToggle, suppressClickRef }) => {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
+    useSortable({ id: player.id, data: { type: 'seat' } });
+
+  const style = {
+    transform: CSS.Translate.toString(transform),
+    transition,
+    touchAction: 'manipulation'
+  };
+
+  const dropTarget = dealerArmed && isOver && !isDealer;
+
+  return (
+    <button
+      ref={setNodeRef}
+      style={style}
+      {...listeners}
+      {...attributes}
+      onClick={() => {
+        // A drag ends with a click on some browsers; ignore that one.
+        if (suppressClickRef.current) return;
+        onToggle(player.id);
+      }}
+      className={`flex items-center justify-between gap-1 px-3 py-2.5 rounded-xl text-sm font-bold border-2 select-none transition-all ${isDragging ? 'opacity-40' : 'active:scale-95'} ${dropTarget ? 'ring-4 ring-amber-300 border-amber-400 scale-105' : ''} ${player.active ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm shadow-emerald-200' : 'bg-white text-slate-400 border-slate-100'}`}
+    >
+      <span className="truncate">{player.name}</span>
+      <span className="flex items-center gap-1 shrink-0">
+        {player.skipRotation && (
+          <SkipForward size={12} className={player.active ? 'text-emerald-200' : 'text-slate-300'} />
+        )}
+        {isDealer
+          ? <DealerToken onLight={player.active} />
+          : <DealerSlot armed={dealerArmed} onLight={player.active} />}
+      </span>
+    </button>
+  );
+};
+
 // Who is seated this hand, who is dealing, who has stepped away. Tap any
 // player to swap them between playing and sitting out.
-const TableCard = ({ players, presentPlayers, activePlayers, dealerId, toggleSeat, passDeal }) => {
+const TableCard = ({ players, presentPlayers, activePlayers, dealerId,
+                    toggleSeat, passDeal, reorderPlayers, setDealer }) => {
   const awayPlayers = players.filter(p => p.away);
   const seated = activePlayers.length;
   const balanced = seated === HAND_SIZE;
+
+  const sensors = useTactileSensors();
+  const [activeDrag, setActiveDrag] = useState(null);
+  const suppressClickRef = useRef(false);
+
+  const dealerArmed = activeDrag?.type === 'dealer';
+  const draggedPlayer = activeDrag?.type === 'seat'
+    ? presentPlayers.find(p => p.id === activeDrag.id)
+    : null;
+
+  const endDrag = () => {
+    setActiveDrag(null);
+    // The click that follows a drag must not toggle the puck we just moved.
+    suppressClickRef.current = true;
+    setTimeout(() => { suppressClickRef.current = false; }, 0);
+  };
+
+  const handleDragEnd = ({ active, over }) => {
+    endDrag();
+    // Dropped on nothing: treat as a cancel and change nothing.
+    if (!over) return;
+
+    if (active.data.current?.type === 'dealer') {
+      if (over.id !== 'dealer-token' && over.id !== dealerId) setDealer(over.id);
+      return;
+    }
+    if (active.id === over.id) return;
+    const from = players.findIndex(p => p.id === active.id);
+    const to = players.findIndex(p => p.id === over.id);
+    if (from !== -1 && to !== -1) reorderPlayers(from, to);
+  };
 
   return (
     <Card className="p-4 space-y-3">
@@ -845,31 +978,61 @@ const TableCard = ({ players, presentPlayers, activePlayers, dealerId, toggleSea
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-2">
-        {presentPlayers.map(p => (
-          <button
-            key={p.id}
-            onClick={() => toggleSeat(p.id)}
-            className={`flex items-center justify-between gap-1 px-3 py-2.5 rounded-xl text-sm font-bold border-2 transition-all active:scale-95 ${p.active ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm shadow-emerald-200' : 'bg-white text-slate-400 border-slate-100 hover:border-slate-200'}`}
-          >
-            <span className="truncate">{p.name}</span>
-            <span className="flex items-center gap-1 shrink-0">
-              {p.skipRotation && (
-                <SkipForward size={12} className={p.active ? 'text-emerald-200' : 'text-slate-300'} />
-              )}
-              {dealerId === p.id && (
-                <span className={`w-5 h-5 rounded-full text-[9px] font-black flex items-center justify-center ${p.active ? 'bg-white/25 text-white' : 'bg-slate-800 text-white'}`}>
-                  D
-                </span>
-              )}
-            </span>
-          </button>
-        ))}
-      </div>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={pointerWithin}
+        onDragStart={({ active }) =>
+          setActiveDrag({ type: active.data.current?.type, id: active.id })}
+        onDragCancel={endDrag}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext items={presentPlayers.map(p => p.id)} strategy={rectSortingStrategy}>
+          <div className="grid grid-cols-2 gap-2">
+            {presentPlayers.map(p => (
+              <SortablePuck
+                key={p.id}
+                player={p}
+                isDealer={dealerId === p.id}
+                dealerArmed={dealerArmed}
+                onToggle={toggleSeat}
+                suppressClickRef={suppressClickRef}
+              />
+            ))}
+          </div>
+        </SortableContext>
 
-      {!balanced && (
+        {/* Portalled: the Card clips overflow, which would cut the lifted puck off. */}
+        {createPortal(
+          <DragOverlay dropAnimation={{ duration: 180, easing: 'cubic-bezier(0.2,0,0,1)' }}>
+            {dealerArmed && (
+              <span className="w-9 h-9 rounded-full bg-slate-900 text-white text-sm font-black flex items-center justify-center shadow-2xl ring-4 ring-amber-300 rotate-6">
+                D
+              </span>
+            )}
+            {draggedPlayer && (
+              <div className="flex items-center justify-between gap-1 px-3 py-2.5 rounded-xl text-sm font-bold border-2 bg-emerald-600 text-white border-emerald-500 shadow-2xl shadow-emerald-900/30 scale-105 rotate-2">
+                <span className="truncate">{draggedPlayer.name}</span>
+                <GripVertical size={14} className="opacity-60" />
+              </div>
+            )}
+          </DragOverlay>,
+          document.body
+        )}
+      </DndContext>
+
+      {activeDrag ? (
+        <p className="text-[11px] font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex items-center gap-2">
+          <AlertTriangle size={13} className="shrink-0" />
+          {dealerArmed ? 'Drop the D on a player to make them dealer.' : 'Drop on another player to swap seats.'}
+          <span className="text-amber-600/80">{DRAG_HINT}.</span>
+        </p>
+      ) : !balanced ? (
         <p className="text-[11px] font-medium text-rose-600 bg-rose-50 border border-rose-100 rounded-lg px-3 py-2">
           Tap players to {seated > HAND_SIZE ? 'sit some out' : 'seat more'} until {HAND_SIZE} are playing.
+        </p>
+      ) : (
+        <p className="text-[10px] text-slate-400 px-1">
+          Tap to sit out · hold to drag a seat · drag the <span className="font-black text-slate-500">D</span> to pass the deal
         </p>
       )}
 
@@ -891,7 +1054,7 @@ const GameView = ({
   wageredPots, setWageredPots, pickerId, setPickerId, 
   partnerId, setPartnerId, crackState, setCrackState, outcome, setOutcome, 
   handGrade, setHandGrade, calculateScore, setView, players, dealerId,
-  startThreeKings, toggleSeat, passDeal
+  startThreeKings, toggleSeat, passDeal, reorderPlayers, setDealer
 }) => {
   const isReady = activePlayers.length === HAND_SIZE;
   const table = (
@@ -902,6 +1065,8 @@ const GameView = ({
       dealerId={dealerId}
       toggleSeat={toggleSeat}
       passDeal={passDeal}
+      reorderPlayers={reorderPlayers}
+      setDealer={setDealer}
     />
   );
   
@@ -1514,101 +1679,127 @@ const StatsView = ({ players, history, manuallySetDealer, dealerId, updateName, 
   );
 };
 
-// Array order is the seating order, and the deal rotates through it, so it is
-// directly editable: drag a row by its handle, or nudge it with the arrows on
-// touch screens where a long drag is awkward.
-const SeatOrderList = ({ players, dealerId, reorderPlayers, movePlayer }) => {
-  const [dragId, setDragId] = useState(null);
-  const containerRef = useRef(null);
+// Array order is the seating order, and the deal rotates through it. Drag a row
+// by its handle, or nudge it with the arrows - the arrows also cover a list too
+// long to drag across on a phone.
+const SortableSeatRow = ({ player, index, count, dealerId, movePlayer, setDealer }) => {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: player.id });
 
-  const rowIndexAt = (clientY) => {
-    const rows = Array.from(containerRef.current?.children || []);
-    return rows.findIndex(row => {
-      const box = row.getBoundingClientRect();
-      return clientY >= box.top && clientY <= box.bottom;
-    });
-  };
-
-  // Tracking on window rather than via setPointerCapture: the handle is a small
-  // target, and once a thumb slides off it a capture-based drag stalls. The
-  // handle's touch-action:none is what stops iOS scrolling the page instead.
-  useEffect(() => {
-    if (dragId === null) return undefined;
-
-    const onMove = (e) => {
-      const to = rowIndexAt(e.clientY);
-      const from = players.findIndex(p => p.id === dragId);
-      if (to !== -1 && from !== -1 && to !== from) reorderPlayers(from, to);
-    };
-    const onEnd = () => setDragId(null);
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onEnd);
-    window.addEventListener('pointercancel', onEnd);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onEnd);
-      window.removeEventListener('pointercancel', onEnd);
-    };
-  });
+  const style = { transform: CSS.Translate.toString(transform), transition };
 
   return (
-    <div ref={containerRef} className="space-y-2">
-      {players.map((player, idx) => (
-        <div
-          key={player.id}
-          data-seat={idx + 1}
-          className={`flex items-center gap-1.5 px-1.5 py-1 rounded-xl border bg-white shadow-sm transition-shadow select-none ${dragId === player.id ? 'border-emerald-400 shadow-lg ring-2 ring-emerald-100 relative z-10' : 'border-slate-200'}`}
+    <div
+      ref={setNodeRef}
+      style={style}
+      data-seat={index + 1}
+      className={`flex items-center gap-1.5 px-1.5 py-1 rounded-xl border bg-white shadow-sm select-none ${isDragging ? 'opacity-40 border-emerald-300' : 'border-slate-200'}`}
+    >
+      <div
+        {...listeners}
+        {...attributes}
+        data-drag-handle=""
+        aria-label={`Reorder ${player.name}`}
+        className="p-3 -my-1 text-slate-400 hover:text-slate-600 cursor-grab active:cursor-grabbing"
+        title="Drag to reorder"
+      >
+        <GripVertical size={20} />
+      </div>
+
+      <span className="w-6 h-6 shrink-0 rounded-full bg-slate-100 text-slate-500 text-[11px] font-bold flex items-center justify-center">
+        {index + 1}
+      </span>
+
+      <span className={`flex-1 font-bold truncate ${player.away ? 'text-slate-400' : 'text-slate-700'}`}>
+        {player.name}
+      </span>
+
+      {player.away ? (
+        <span className="text-[9px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full">Away</span>
+      ) : (
+        <button
+          onClick={() => setDealer(player.id)}
+          aria-label={dealerId === player.id ? `${player.name} is dealing` : `Make ${player.name} the dealer`}
+          title={dealerId === player.id ? 'Dealing' : 'Make dealer'}
+          className={`w-7 h-7 shrink-0 rounded-full text-[10px] font-black flex items-center justify-center transition-colors ${dealerId === player.id ? 'bg-slate-800 text-white' : 'bg-slate-50 text-slate-300 hover:text-slate-500 border border-slate-200'}`}
         >
-          <div
-            onPointerDown={(e) => { e.preventDefault(); setDragId(player.id); }}
-            data-drag-handle=""
-            className="p-3 -my-1 text-slate-400 hover:text-slate-600 cursor-grab active:cursor-grabbing"
-            title="Drag to reorder"
-          >
-            <GripVertical size={20} />
-          </div>
+          D
+        </button>
+      )}
 
-          <span className="w-6 h-6 shrink-0 rounded-full bg-slate-100 text-slate-500 text-[11px] font-bold flex items-center justify-center">
-            {idx + 1}
-          </span>
-
-          <span className={`flex-1 font-bold truncate ${player.away ? 'text-slate-400' : 'text-slate-700'}`}>
-            {player.name}
-          </span>
-
-          {dealerId === player.id && (
-            <span className="w-5 h-5 shrink-0 rounded-full bg-slate-800 text-white text-[9px] font-black flex items-center justify-center" title="Dealer">D</span>
-          )}
-          {player.away && (
-            <span className="text-[9px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full">Away</span>
-          )}
-
-          <div className="flex shrink-0">
-            <button
-              onClick={() => movePlayer(player.id, -1)}
-              disabled={idx === 0}
-              className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-emerald-600 active:text-emerald-700 disabled:opacity-25 transition-colors"
-              title="Move up"
-            >
-              <ChevronUp size={20} />
-            </button>
-            <button
-              onClick={() => movePlayer(player.id, 1)}
-              disabled={idx === players.length - 1}
-              className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-emerald-600 active:text-emerald-700 disabled:opacity-25 transition-colors"
-              title="Move down"
-            >
-              <ChevronDown size={20} />
-            </button>
-          </div>
-        </div>
-      ))}
+      <div className="flex shrink-0">
+        <button
+          onClick={() => movePlayer(player.id, -1)}
+          disabled={index === 0}
+          className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-emerald-600 active:text-emerald-700 disabled:opacity-25 transition-colors"
+          title="Move up"
+        >
+          <ChevronUp size={20} />
+        </button>
+        <button
+          onClick={() => movePlayer(player.id, 1)}
+          disabled={index === count - 1}
+          className="w-11 h-11 flex items-center justify-center text-slate-400 hover:text-emerald-600 active:text-emerald-700 disabled:opacity-25 transition-colors"
+          title="Move down"
+        >
+          <ChevronDown size={20} />
+        </button>
+      </div>
     </div>
   );
 };
 
-const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewGame, pots, totalPotValue, toggleAway, dealerId, reorderPlayers, movePlayer }) => {
+const SeatOrderList = ({ players, dealerId, reorderPlayers, movePlayer, setDealer }) => {
+  const sensors = useTactileSensors();
+  const [activeId, setActiveId] = useState(null);
+  const dragged = players.find(p => p.id === activeId);
+
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={pointerWithin}
+      onDragStart={({ active }) => setActiveId(active.id)}
+      onDragCancel={() => setActiveId(null)}
+      onDragEnd={({ active, over }) => {
+        setActiveId(null);
+        if (!over || active.id === over.id) return;   // outside = cancel
+        const from = players.findIndex(p => p.id === active.id);
+        const to = players.findIndex(p => p.id === over.id);
+        if (from !== -1 && to !== -1) reorderPlayers(from, to);
+      }}
+    >
+      <SortableContext items={players.map(p => p.id)} strategy={verticalListSortingStrategy}>
+        <div className="space-y-2">
+          {players.map((player, idx) => (
+            <SortableSeatRow
+              key={player.id}
+              player={player}
+              index={idx}
+              count={players.length}
+              dealerId={dealerId}
+              movePlayer={movePlayer}
+              setDealer={setDealer}
+            />
+          ))}
+        </div>
+      </SortableContext>
+
+      {createPortal(
+        <DragOverlay dropAnimation={{ duration: 180, easing: 'cubic-bezier(0.2,0,0,1)' }}>
+          {dragged && (
+            <div className="flex items-center gap-2 px-3 py-3 rounded-xl border-2 border-emerald-400 bg-white shadow-2xl shadow-emerald-900/20 scale-105 rotate-1">
+              <GripVertical size={20} className="text-emerald-500" />
+              <span className="font-bold text-slate-800">{dragged.name}</span>
+            </div>
+          )}
+        </DragOverlay>,
+        document.body
+      )}
+    </DndContext>
+  );
+};
+
+const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewGame, pots, totalPotValue, toggleAway, dealerId, reorderPlayers, movePlayer, setDealer }) => {
   const [seatMode, setSeatMode] = useState(false);
   const [emailRecipient, setEmailRecipient] = useState('');
   const [showEmailForm, setShowEmailForm] = useState(false);
@@ -1672,7 +1863,7 @@ const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewG
       {seatMode ? (
         <div className="space-y-3">
           <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3 leading-relaxed">
-            Seat order is the deal rotation. Drag a row by its handle, or use the arrows.
+            Seat order is the deal rotation. Hold a handle to drag, or use the arrows. Tap D to set the dealer.
             Move a returning player to whichever seat they actually took.
           </p>
           <SeatOrderList
@@ -1680,6 +1871,7 @@ const PlayersView = ({ players, addPlayer, updateName, removePlayer, requestNewG
             dealerId={dealerId}
             reorderPlayers={reorderPlayers}
             movePlayer={movePlayer}
+            setDealer={setDealer}
           />
         </div>
       ) : (
@@ -2298,9 +2490,9 @@ export default function App() {
         {view === 'startMenu' && <StartMenuView startNewGame={requestNewGame} hasSavedGame={hasSavedGame} loadGame={loadGame} setView={setView} />}
         {view === 'rules' && <RulesView setView={setView} />}
         {/* GameView now replaces ScoreboardView + NewHandView logic for main play */}
-        {view === 'game' && <GameView activePlayers={activePlayers} presentPlayers={presentPlayers} toggleSeat={toggleSeat} passDeal={passDeal} pots={pots} totalPotValue={totalPotValue} handlePass={handlePass} wageredPots={wageredPots} setWageredPots={setWageredPots} pickerId={pickerId} setPickerId={setPickerId} partnerId={partnerId} setPartnerId={setPartnerId} crackState={crackState} setCrackState={setCrackState} outcome={outcome} setOutcome={setOutcome} handGrade={handGrade} setHandGrade={setHandGrade} calculateScore={calculateScore} setView={setView} players={players} dealerId={dealerId} startThreeKings={startThreeKings} />}
+        {view === 'game' && <GameView activePlayers={activePlayers} presentPlayers={presentPlayers} toggleSeat={toggleSeat} passDeal={passDeal} reorderPlayers={reorderPlayers} setDealer={manuallySetDealer} pots={pots} totalPotValue={totalPotValue} handlePass={handlePass} wageredPots={wageredPots} setWageredPots={setWageredPots} pickerId={pickerId} setPickerId={setPickerId} partnerId={partnerId} setPartnerId={setPartnerId} crackState={crackState} setCrackState={setCrackState} outcome={outcome} setOutcome={setOutcome} handGrade={handGrade} setHandGrade={setHandGrade} calculateScore={calculateScore} setView={setView} players={players} dealerId={dealerId} startThreeKings={startThreeKings} />}
         {view === 'stats' && <StatsView players={players} history={history} manuallySetDealer={manuallySetDealer} dealerId={dealerId} updateName={updateName} toggleSkipRotation={toggleSkipRotation} toggleAway={toggleAway} potCount={pots.length} setView={setView} setShowBigBoard={setShowBigBoard} setEditingHand={setEditingHand} />}
-        {view === 'players' && <PlayersView players={players} addPlayer={addPlayer} updateName={updateName} removePlayer={requestRemovePlayer} requestNewGame={requestNewGame} pots={pots} totalPotValue={totalPotValue} toggleAway={toggleAway} dealerId={dealerId} reorderPlayers={reorderPlayers} movePlayer={movePlayer} />}
+        {view === 'players' && <PlayersView players={players} addPlayer={addPlayer} updateName={updateName} removePlayer={requestRemovePlayer} requestNewGame={requestNewGame} pots={pots} totalPotValue={totalPotValue} toggleAway={toggleAway} dealerId={dealerId} reorderPlayers={reorderPlayers} movePlayer={movePlayer} setDealer={manuallySetDealer} />}
         {view === 'season' && <SeasonView season={season} setView={setView} clearSeason={clearSeason} />}
         {view === 'kings' && <ThreeKingsView presentPlayers={presentPlayers} handleThreeKings={handleThreeKings} setView={setView} />}
       </main>

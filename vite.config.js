@@ -5,6 +5,9 @@ import { VitePWA } from 'vite-plugin-pwa'
 // https://vitejs.dev/config/
 export default defineConfig({
   base: "/sheepshead-scorer/",
+  // Honour an assigned port so a second dev server can run alongside this one.
+  server: { port: Number(process.env.PORT) || 5173 },
+  preview: { port: Number(process.env.PORT) || 4173 },
   plugins: [
     react(),
     VitePWA({
