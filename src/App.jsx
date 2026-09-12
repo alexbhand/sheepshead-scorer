@@ -663,9 +663,12 @@ const nextDealerFrom = (currentId, list) => {
   return next ? next.id : currentId;
 };
 
-// Exactly HAND_SIZE players sit in each hand. The dealer sits out first, then
-// the seats following them. Anyone flagged skipRotation is pulled out ahead of
-// that, and anyone away is never seated at all.
+// Exactly HAND_SIZE players sit in each hand. The dealer deals to their left,
+// so the hand is the HAND_SIZE seats immediately clockwise of the dealer - the
+// player next to the dealer is always in. That means the seats that sit out are
+// the dealer and the ones *behind* them, counted backwards round the table.
+// Anyone flagged skipRotation is pulled out ahead of that, and anyone away is
+// never seated at all.
 const recomputeSeating = (dealerId, list) => {
   const present = list.filter(p => !p.away);
   if (present.length <= HAND_SIZE) {
@@ -673,12 +676,14 @@ const recomputeSeating = (dealerId, list) => {
   }
   const sitCount = present.length - HAND_SIZE;
   const order = seatOrderFrom(dealerId, present);
+  // dealer first, then back round the table away from the deal
+  const backwards = [order[0], ...order.slice(1).reverse()];
   const sitters = [];
   const take = (p) => {
-    if (sitters.length < sitCount && !sitters.includes(p.id)) sitters.push(p.id);
+    if (p && sitters.length < sitCount && !sitters.includes(p.id)) sitters.push(p.id);
   };
-  order.filter(p => p.skipRotation).forEach(take);
-  order.forEach(take);
+  backwards.filter(p => p.skipRotation).forEach(take);
+  backwards.forEach(take);
   return list.map(p => ({ ...p, active: !p.away && !sitters.includes(p.id) }));
 };
 
