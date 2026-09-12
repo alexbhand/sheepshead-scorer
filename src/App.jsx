@@ -930,6 +930,31 @@ const useTactileSensors = () => useSensors(
 
 const DRAG_HINT = 'Drop outside the table to cancel';
 
+// The deal travels clockwise round a real table, so the grid is laid out as a
+// ring rather than in reading order: across the top, down the right column,
+// along the bottom, then back up the left. Seat order in `players` is the
+// physical seating and is not touched - this only decides where each seat is
+// drawn, so the deal visibly steps to the next chair instead of jumping from
+// the end of one row to the start of the next.
+const ringOrder = (list) => {
+  const n = list.length;
+  if (n < 3) return list.map(player => ({ player, span: false }));
+
+  const half = Math.floor(n / 2);
+  const odd = n % 2 === 1;
+  const right = list.slice(1, half + 1);                       // top-right downwards
+  const left = [list[0], ...list.slice(half + (odd ? 2 : 1)).reverse()]; // top-left downwards
+  const bottom = odd ? list[half + 1] : null;                  // the odd seat sits centre-bottom
+
+  const cells = [];
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i]) cells.push({ player: left[i], span: false });
+    if (right[i]) cells.push({ player: right[i], span: false });
+  }
+  if (bottom) cells.push({ player: bottom, span: true });
+  return cells;
+};
+
 // The dealer button as a physical token: drag it onto whoever is dealing
 // instead of stepping the deal round one player at a time.
 const DealerToken = ({ onLight }) => {
@@ -972,7 +997,7 @@ const DealerSlot = ({ armed, onLight }) => (
   </span>
 );
 
-const SortablePuck = ({ player, isDealer, dealerArmed, onToggle, suppressClickRef }) => {
+const SortablePuck = ({ player, isDealer, dealerArmed, onToggle, suppressClickRef, span = false }) => {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging, isOver } =
     useSortable({ id: player.id, data: { type: 'seat' } });
 
@@ -981,6 +1006,9 @@ const SortablePuck = ({ player, isDealer, dealerArmed, onToggle, suppressClickRe
     transition,
     touchAction: 'manipulation'
   };
+  // A lone bottom seat spans both columns but keeps a puck's width, centred,
+  // so the ring closes without leaving a hole in the grid.
+  const slot = span ? 'col-span-2 justify-self-center w-[calc(50%-0.25rem)]' : '';
 
   const dropTarget = dealerArmed && isOver && !isDealer;
 
@@ -995,7 +1023,7 @@ const SortablePuck = ({ player, isDealer, dealerArmed, onToggle, suppressClickRe
         if (suppressClickRef.current) return;
         onToggle(player.id);
       }}
-      className={`relative flex items-center justify-between gap-1 px-3.5 py-3 rounded-xl text-sm font-bold select-none transition-all duration-200 outline-none focus-visible:ring-2 focus-visible:ring-amber-300/70 ${isDragging ? 'opacity-40' : 'active:scale-95'} ${dropTarget ? 'ring-4 ring-amber-300 scale-105 shadow-[0_10px_30px_-6px_rgba(251,191,36,0.6)]' : ''} ${player.active
+      className={`relative flex items-center justify-between gap-1 px-3.5 py-3 rounded-xl text-sm font-bold select-none transition-all duration-200 outline-none focus-visible:ring-2 focus-visible:ring-amber-300/70 ${slot} ${isDragging ? 'opacity-40' : 'active:scale-95'} ${dropTarget ? 'ring-4 ring-amber-300 scale-105 shadow-[0_10px_30px_-6px_rgba(251,191,36,0.6)]' : ''} ${player.active
         ? 'sheen bg-gradient-to-b from-emerald-500 to-emerald-700 text-white ring-1 ring-emerald-300/40 shadow-[0_6px_20px_-8px_rgba(16,185,129,0.85)]'
         : 'bg-white/[0.05] text-slate-400 ring-1 ring-white/10'}`}
     >
@@ -1024,6 +1052,7 @@ const TableCard = ({ players, presentPlayers, activePlayers, dealerId,
   const [activeDrag, setActiveDrag] = useState(null);
   const suppressClickRef = useRef(false);
 
+  const seatRing = ringOrder(presentPlayers);
   const dealerArmed = activeDrag?.type === 'dealer';
   const draggedPlayer = activeDrag?.type === 'seat'
     ? presentPlayers.find(p => p.id === activeDrag.id)
@@ -1077,13 +1106,14 @@ const TableCard = ({ players, presentPlayers, activePlayers, dealerId,
         onDragCancel={endDrag}
         onDragEnd={handleDragEnd}
       >
-        <SortableContext items={presentPlayers.map(p => p.id)} strategy={rectSortingStrategy}>
+        <SortableContext items={seatRing.map(c => c.player.id)} strategy={rectSortingStrategy}>
           <div className="grid grid-cols-2 gap-2">
-            {presentPlayers.map(p => (
+            {seatRing.map(({ player, span }) => (
               <SortablePuck
-                key={p.id}
-                player={p}
-                isDealer={dealerId === p.id}
+                key={player.id}
+                player={player}
+                span={span}
+                isDealer={dealerId === player.id}
                 dealerArmed={dealerArmed}
                 onToggle={toggleSeat}
                 suppressClickRef={suppressClickRef}
