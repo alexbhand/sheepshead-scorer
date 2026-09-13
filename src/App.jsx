@@ -1180,7 +1180,7 @@ const GameView = ({
   wageredPots, setWageredPots, pickerId, setPickerId, 
   partnerId, setPartnerId, crackState, setCrackState, outcome, setOutcome, 
   handGrade, setHandGrade, calculateScore, setView, players, dealerId,
-  startThreeKings, toggleSeat, passDeal, reorderPlayers, setDealer
+  startThreeKings, toggleSeat, passDeal, reorderPlayers, setDealer, justSaved
 }) => {
   const isReady = activePlayers.length === HAND_SIZE;
   const table = (
@@ -1428,13 +1428,27 @@ const GameView = ({
         </div>
       </Card>
 
-      <Button
-        onClick={calculateScore}
-        disabled={!pickerId || !partnerId}
-        className="w-full py-4 text-base tracking-wide rounded-2xl shadow-[0_14px_40px_-10px_rgba(16,185,129,0.75)]"
-      >
-        <Check size={18} strokeWidth={3} /> Save Score
-      </Button>
+      <div className="space-y-2">
+        <Button
+          onClick={calculateScore}
+          disabled={!pickerId || !partnerId || justSaved}
+          className={`w-full py-4 text-base tracking-wide rounded-2xl transition-all duration-200 ${justSaved
+            ? 'opacity-100 active:scale-100 from-emerald-300 to-emerald-500 ring-emerald-200/70 shadow-[0_16px_50px_-8px_rgba(16,185,129,1)] scale-[1.01]'
+            : 'shadow-[0_14px_40px_-10px_rgba(16,185,129,0.75)]'}`}
+        >
+          {justSaved
+            ? <><CheckCircle size={19} strokeWidth={3} /> Saved</>
+            : <><Check size={18} strokeWidth={3} /> Save Score</>}
+        </Button>
+
+        {!justSaved && (!pickerId || !partnerId) && (
+          <p className="text-[11px] text-slate-500 text-center">
+            {!pickerId
+              ? 'Choose who picked to save this hand.'
+              : 'Choose a partner, or tap Alone.'}
+          </p>
+        )}
+      </div>
 
       {/* 3 Kings Button (Convenience) */}
       <div className="flex justify-center pt-2">
@@ -2162,6 +2176,8 @@ export default function App() {
   const [hasSavedGame, setHasSavedGame] = useState(false);
   const [toast, setToast] = useState({ show: false, message: '' });
   const toastTimer = useRef(null);
+  const [justSaved, setJustSaved] = useState(false);
+  const savedTimer = useRef(null);
   
   // Settings / Email State
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -2530,9 +2546,16 @@ export default function App() {
   const calculateScore = () => {
     if (!pickerId) return;
     const seatedIds = activePlayers.map(p => p.id);
-    // Refuse to score a hand whose picker or partner is not actually seated.
-    if (!seatedIds.includes(pickerId)) return;
-    if (partnerId && partnerId !== pickerId && !seatedIds.includes(partnerId)) return;
+    // Refuse to score a hand whose picker or partner is not seated - but say so,
+    // rather than letting the tap do nothing at all.
+    if (!seatedIds.includes(pickerId)) {
+      showToast("The picker is not in this hand");
+      return;
+    }
+    if (partnerId && partnerId !== pickerId && !seatedIds.includes(partnerId)) {
+      showToast("The partner is not in this hand");
+      return;
+    }
 
     const action = {
       type: 'hand',
@@ -2551,6 +2574,16 @@ export default function App() {
     const { changes, nextPots, desc } = scoreHand(action, pots);
     applyTransaction(changes, nextPots, desc, true, action);
     showToast(outcome === 'win' ? "Score Saved: Picker Won" : "Score Saved: Picker Lost");
+
+    // The button lives at the bottom of a long form while the toast sits at the
+    // top of the viewport, so on a phone the confirmation fired off-screen. Flash
+    // the confirmation on the button itself, where the thumb already is, and
+    // return to the top where the fresh hand and the toast are both visible.
+    setJustSaved(true);
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+    savedTimer.current = setTimeout(() => setJustSaved(false), 1200);
+    const smooth = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: 0, behavior: smooth ? 'smooth' : 'auto' });
   };
 
   // Records the move and swaps state in. `resetHand` is off for roster changes
@@ -2721,7 +2754,7 @@ export default function App() {
         {view === 'startMenu' && <StartMenuView startNewGame={requestNewGame} hasSavedGame={hasSavedGame} loadGame={loadGame} setView={setView} />}
         {view === 'rules' && <RulesView setView={setView} />}
         {/* GameView now replaces ScoreboardView + NewHandView logic for main play */}
-        {view === 'game' && <GameView activePlayers={activePlayers} presentPlayers={presentPlayers} toggleSeat={toggleSeat} passDeal={passDeal} reorderPlayers={reorderPlayers} setDealer={manuallySetDealer} pots={pots} totalPotValue={totalPotValue} handlePass={handlePass} wageredPots={wageredPots} setWageredPots={setWageredPots} pickerId={pickerId} setPickerId={setPickerId} partnerId={partnerId} setPartnerId={setPartnerId} crackState={crackState} setCrackState={setCrackState} outcome={outcome} setOutcome={setOutcome} handGrade={handGrade} setHandGrade={setHandGrade} calculateScore={calculateScore} setView={setView} players={players} dealerId={dealerId} startThreeKings={startThreeKings} />}
+        {view === 'game' && <GameView activePlayers={activePlayers} presentPlayers={presentPlayers} toggleSeat={toggleSeat} passDeal={passDeal} reorderPlayers={reorderPlayers} setDealer={manuallySetDealer} pots={pots} totalPotValue={totalPotValue} handlePass={handlePass} wageredPots={wageredPots} setWageredPots={setWageredPots} pickerId={pickerId} setPickerId={setPickerId} partnerId={partnerId} setPartnerId={setPartnerId} crackState={crackState} setCrackState={setCrackState} outcome={outcome} setOutcome={setOutcome} handGrade={handGrade} setHandGrade={setHandGrade} calculateScore={calculateScore} setView={setView} players={players} dealerId={dealerId} startThreeKings={startThreeKings} justSaved={justSaved} />}
         {view === 'stats' && <StatsView players={players} history={history} manuallySetDealer={manuallySetDealer} dealerId={dealerId} updateName={updateName} toggleSkipRotation={toggleSkipRotation} toggleAway={toggleAway} potCount={pots.length} setView={setView} setShowBigBoard={setShowBigBoard} setEditingHand={setEditingHand} />}
         {view === 'players' && <PlayersView players={players} addPlayer={addPlayer} updateName={updateName} removePlayer={requestRemovePlayer} requestNewGame={requestNewGame} pots={pots} totalPotValue={totalPotValue} toggleAway={toggleAway} dealerId={dealerId} reorderPlayers={reorderPlayers} movePlayer={movePlayer} setDealer={manuallySetDealer} />}
         {view === 'season' && <SeasonView season={season} setView={setView} clearSeason={clearSeason} />}
