@@ -312,6 +312,28 @@ const normalizePot = (pot, idx) => (
       }
 );
 
+// Pots saved before they carried a contribution ledger are stored as bare
+// numbers, and without a ledger nobody can reclaim their ante when they step
+// away - the money is simply won by whoever takes the pot. Every ante is a
+// quarter, so rebuild a plausible ledger by handing a quarter to each player
+// until the pot's value is accounted for. Anything left over (a sitter penalty,
+// say) stays in the pot unattributed, which is the conservative choice.
+// Only the bare-number form is rebuilt: a matched pot is always an object and
+// its empty ledger is correct, because that money came from the picker.
+const backfillLegacyPot = (pot, roster) => {
+  if (typeof pot !== 'number' || !Number.isFinite(pot)) return pot;
+  const total = money(pot);
+  const contributions = {};
+  let assigned = 0;
+  roster.forEach(p => {
+    if (money(assigned + POT_CONTRIBUTION) <= total) {
+      contributions[p.id] = POT_CONTRIBUTION;
+      assigned = money(assigned + POT_CONTRIBUTION);
+    }
+  });
+  return { value: total, contributions };
+};
+
 const normalizePlayer = (p) => ({ away: false, skipRotation: false, ...p });
 
 // A save written by an older build can carry a balance as a string or null.
@@ -2260,7 +2282,7 @@ export default function App() {
       // A hand is only ever dealt with 5 seated, so re-derive the seating on
       // load. Saves written by the old rotation could hold a bad count.
       setPlayers(recomputeSeating(loadedDealer, loadedPlayers));
-      setPots((data.pots || []).map(normalizePot));
+      setPots((data.pots || []).map((pot, i) => normalizePot(backfillLegacyPot(pot, loadedPlayers), i)));
       setHistory(data.history || []);
       setDealerId(loadedDealer);
       setView('game'); // Load into game view
@@ -2429,9 +2451,19 @@ export default function App() {
     if (pickerId === player.id) setPickerId(null);
     if (partnerId === player.id) setPartnerId(null);
 
+    // Leaving with money on the table but nothing reclaimable means their stake
+    // is stranded, so say so rather than reporting a plain departure.
+    const stranded = !refund && pots.length > 0;
     commit(list, nextPots, nextDealer, changes,
-      refund ? `${player.name} away (refunded $${refund.toFixed(2)})` : `${player.name} away`, false);
-    showToast(refund ? `${player.name} away — $${refund.toFixed(2)} refunded` : `${player.name} is away`);
+      refund
+        ? `${player.name} away (refunded $${refund.toFixed(2)})`
+        : stranded ? `${player.name} away (no pot stake on record)` : `${player.name} away`,
+      false);
+    showToast(
+      refund ? `${player.name} away — $${refund.toFixed(2)} refunded`
+        : stranded ? `${player.name} away — no pot stake on record`
+        : `${player.name} is away`
+    );
   };
 
   // Coming back costs a quarter into every pot currently on the table, however
